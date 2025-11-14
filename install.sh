@@ -1,6 +1,145 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -Eeuo pipefail
 
+# Simple logging helpers (ASCII-only)
+log()  { printf "\n[INFO] %s\n" "$*"; }
+warn() { printf "\n[WARN] %s\n" "$*"; }
+die()  { printf "\n[ERROR] %s\n" "$*" >&2; exit 1; }
+
+# Ensure running as root
+if [ "$(id -u)" -ne 0 ]; then
+  die "This script must be run as root. Use sudo."
+fi
+
+# Basic OS detection
+if [ -r /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  source /etc/os-release
+else
+  die "/etc/os-release not readable. Aborting."
+fi
+
+if [[ "${ID:-}" != "ubuntu" || ! "${VERSION_ID:-}" =~ ^22\. ]]; then
+  warn "Detected OS is not Ubuntu 22.xx. Proceed at your own risk."
+fi
+
+UBU_CODENAME="${VERSION_CODENAME:-jammy}"
+ARCH="$(dpkg --print-architecture)"
+
+# Default user to add to docker group (can be overridden by env var DOCKER_USER)
+USER_NAME="${DOCKER_USER:-gphost}"
+
+log "Updating apt cache"
+apt-get update -y || warn "apt-get update failed (continuing)"
+
+log "Removing possible old/ conflicting Docker packages"
+apt-get remove -y docker.io docker-doc docker-compose docker-compose-plugin podman-docker containerd runc || true
+
+log "Installing base packages"
+apt-get install -y ca-certificates curl gnupg lsb-release apt-transport-https lxcfs || die "Failed to install base packages"
+
+log "Enabling and starting system docker package (if present)"
+systemctl enable --now docker 2>/dev/null || warn "systemctl enable --now docker failed (maybe package not installed yet)"
+
+log "Creating apt keyrings directory"
+install -m 0755 -d /etc/apt/keyrings
+
+if [ ! -s /etc/apt/keyrings/docker.gpg ]; then
+  log "Fetching Docker official GPG key"
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    || die "Failed to fetch Docker GPG key"
+fi
+chmod a+r /etc/apt/keyrings/docker.gpg || true
+
+log "Adding Docker apt repository for ${ARCH}/${UBU_CODENAME}"
+cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${UBU_CODENAME} stable
+EOF
+
+log "Updating apt cache after adding Docker repo"
+apt-get update -y || die "apt-get update failed after adding Docker repo"
+
+log "Installing Docker Engine and components"
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+  || die "Failed to install Docker Engine and components"
+
+log "Writing recommended Docker daemon configuration to /etc/docker/daemon.json"
+install -m 0755 -d /etc/docker
+cat >/etc/docker/daemon.json <<'JSON'
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "storage-driver": "overlay2",
+  "features": { "buildkit": true },
+  "live-restore": true
+}
+JSON
+
+log "Reloading systemd and restarting docker"
+systemctl daemon-reload
+systemctl enable --now docker || warn "Failed to enable/start docker service"
+
+if systemctl is-active --quiet docker; then
+  log "[OK] Docker service is active"
+else
+  warn "[WARN] Docker service is not active; check 'systemctl status docker' for details"
+fi
+
+# Optional: containerd tuning
+if [ ! -s /etc/containerd/config.toml ]; then
+  if command -v containerd >/dev/null 2>&1; then
+    log "Generating default containerd config at /etc/containerd/config.toml"
+    containerd config default >/etc/containerd/config.toml || warn "containerd config default failed"
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml || true
+    systemctl restart containerd || warn "Failed to restart containerd"
+  else
+    warn "containerd binary not found; skipping containerd config generation"
+  fi
+fi
+
+# Add user to docker group if exists
+if id -u "$USER_NAME" >/dev/null 2>&1; then
+  log "Adding user '${USER_NAME}' to 'docker' group"
+  if ! getent group docker >/dev/null 2>&1; then
+    groupadd docker || warn "Could not create 'docker' group"
+  fi
+  usermod -aG docker "$USER_NAME" || warn "Failed to add ${USER_NAME} to docker group"
+  log "[ INFO ] User '${USER_NAME}' added to docker group (logout/login required to apply)"
+else
+  warn "User '${USER_NAME}' does not exist; skipping group add"
+fi
+
+# UFW compatibility (if ufw is installed and active)
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+  log "UFW is active — adjusting default forward policy and sysctl for docker networking"
+  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw || true
+  if grep -q '^#\?net\/ipv4\/ip_forward' /etc/ufw/sysctl.conf 2>/dev/null; then
+    sed -i 's/^#\?net\/ipv4\/ip_forward=.*/net\/ipv4\/ip_forward=1/' /etc/ufw/sysctl.conf || true
+  else
+    echo 'net/ipv4/ip_forward=1' >> /etc/ufw/sysctl.conf
+  fi
+  ufw reload || warn "ufw reload failed"
+fi
+
+# Quick smoke test (non-fatal)
+log "Quick smoke test: pulling and running hello-world container"
+if docker run --rm hello-world >/dev/null 2>&1; then
+  log "[ OK ] hello-world ran successfully"
+else
+  warn "[ WARN ] hello-world did not run. This might be a network or registry issue. Try: docker run --rm hello-world"
+fi
+
+# Print summary
+log "Summary:"
+printf " - Docker version: " && docker --version || true
+printf " - Daemon config: /etc/docker/daemon.json\n"
+printf " - Buildx and Compose plugin enabled (if installed)\n"
+printf " - User added to docker group: %s (if user existed)\n" "$USER_NAME"
+printf "\n[ OK ] Installation and configuration steps finished.\n"
+log "You may need to log out and back in for group changes to take effect."
+clear
 # ─────────────────────────────────────────────────────────────
 # Branding
 BRAND="Gp TEAM"
@@ -210,3 +349,4 @@ echo "║  Installation Complete! 🚀                   ║"
 echo "║  Produced with ❤️ by ${BRAND}                ║"
 echo "╚══════════════════════════════════════════════╝"
 echo -e "${NC}"
+log "You may need to log out and back in for group changes to take effect."
