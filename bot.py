@@ -9,13 +9,13 @@ import psutil
 from datetime import datetime
 import re
 import time
-time.sleep(2)
+time.sleep(1) # SLEEP 1
 # Configuration
-TOKEN = 'توكنك يا زنجي'  # REPLACE WITH YOUR BOT'S TOKEN
-RAM_LIMIT = '12g' # ابعد ايدك لا ابيدك 
-SERVER_LIMIT = 12# ابعد ايدك لا ابيدك 
-LOGS_CHANNEL_ID =  "بطاطا"   # CHANGE TO YOUR LOGS CHANNEL ID
-ADMIN_ROLE_ID = "بطاطا"   # CHANGE TO YOUR ADMIN ROLE ID
+TOKEN = 'your_token'  # REPLACE WITH YOUR BOT'S TOKEN
+RAM_LIMIT = '12g' # ابعد ايدك لا ابيدك  - DONT EDOT
+SERVER_LIMIT = 12 # ابعد ايدك لا ابيدك  - DONT EDIT
+LOGS_CHANNEL_ID =  "1234567890"   # CHANGE TO YOUR LOGS CHANNEL ID
+ADMIN_ROLE_ID = "1234567890"   # CHANGE TO YOUR ADMIN ROLE ID
 
 database_file = 'database.txt'
 
@@ -293,8 +293,9 @@ async def deploy(
     ram: str,
     cpu: str
 ):
-    # ---------- small async helper ----------
-    async def runp(*args):
+    # ---------------- small async helper ----------------
+    async def runp(*args: str) -> tuple[int, str, str]:
+        """Run a process and capture exit code, stdout, stderr."""
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
@@ -303,38 +304,61 @@ async def deploy(
         out_b, err_b = await proc.communicate()
         return proc.returncode, (out_b or b"").decode(), (err_b or b"").decode()
 
-    # ---------- parse resources ----------
-    def parse_ram_flag(s: str) -> str:
-        # Accept: "2", "2g", "2048m", "1024M", "1.5G" ...
-        if not s:
-            return "1g"
-        s = s.strip().lower()
-        # numbers only => GB
-        try:
-            if s.replace('.', '', 1).isdigit():
-                val = float(s)
-                return f"{val}g"
-        except:
-            pass
-        # already has unit g/m
-        if s.endswith('g') or s.endswith('m'):
-            # basic sanity
-            num = s[:-1]
-            try:
-                float(num)
-                return s
-            except:
-                return "1g"
-        # last fallback
-        return "1g"
+    # ---------------- resource parsing helpers ----------------
+    import re
 
-    def parse_cpu(s: str) -> int:
+    _MEMORY_RE = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*([gm]?)\s*$', re.I)
+
+    def parse_memory_limit(
+        s: str | None,
+        default_gb: float = 1.0,
+        min_mb: int = 256,
+        max_gb: int = 16,
+    ) -> tuple[str, str]:
+        """
+        Parse a memory string into a docker-compatible value and human string.
+
+        Returns:
+            (docker_mem_flag, human_readable)
+            e.g. ("2048m", "2.0 GiB")
+        """
+        if not s:
+            value_gb = default_gb
+        else:
+            s = s.strip()
+            m = _MEMORY_RE.match(s)
+            if not m:
+                value_gb = default_gb
+            else:
+                num = float(m.group(1))
+                unit = (m.group(2) or "g").lower()
+                if unit == "g":
+                    value_gb = num
+                else:  # "m"
+                    value_gb = num / 1024.0
+
+        # Clamp to sane limits
+        value_gb = max(value_gb, min_mb / 1024.0)
+        value_gb = min(value_gb, max_gb)
+
+        mb = int(round(value_gb * 1024))
+        docker_flag = f"{mb}m"
+        human = f"{value_gb:.1f} GiB"
+        return docker_flag, human
+
+    def parse_cpu_cores(s: str | None, max_cores: int = 8) -> int:
+        """
+        Parse CPU cores string into a safe integer between 1 and max_cores.
+        """
+        if not s:
+            return 1
         try:
             v = int(float(s.strip()))
-            return max(1, v)
-        except:
-            return 1
+        except Exception:
+            v = 1
+        return max(1, min(v, max_cores))
 
+    # ---------------- main logic ----------------
     try:
         # ---------- Gatekeeping ----------
         if not await is_admin_role_only(interaction):
@@ -342,6 +366,25 @@ async def deploy(
                 embed=discord.Embed(
                     title="🚫 Permission Denied",
                     description="This command is restricted to administrators only.",
+                    color=0xFF0000
+                ),
+                ephemeral=True
+            )
+            return
+
+        # ---------- Docker availability check ----------
+        docker_rc, _, docker_err = await runp("docker", "info")
+        if docker_rc != 0:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="🐳 Docker Not Available",
+                    description=(
+                        "```diff\n"
+                        "- Docker daemon is not reachable.\n"
+                        "- Please ensure Docker is installed and running on the host.\n"
+                        f"- Error: {docker_err.strip() or 'no error text'}\n"
+                        "```"
+                    ),
                     color=0xFF0000
                 ),
                 ephemeral=True
@@ -364,25 +407,32 @@ async def deploy(
                 ephemeral=True
             )
             return
+
         os_data = OS_OPTIONS[os]
 
         # ---------- resources ----------
-        AVAILABLE_CPUS = [3, 5, 9, 19]
-        mem_flag = parse_ram_flag(ram)             # e.g. "2g"
-        cpu_cores = parse_cpu(cpu)  # int >= 1
-        chosen = AVAILABLE_CPUS[:cpu_cores]
-        cpuset = ",".join(str(c) for c in chosen)
+        mem_flag, mem_human = parse_memory_limit(ram)
+        cpu_cores = parse_cpu_cores(cpu)
+
         # ---------- initial embed ----------
         embed = discord.Embed(
             title=f"🚀 Launching {os_data['emoji']} {os_data['name']} Instance",
-            description=f"```diff\n+ Preparing {os_data['name']} for {user.display_name}...\n```",
+            description="```diff\n+ Preparing instance...\n```",
             color=EMBED_COLOR
         )
         embed.add_field(
             name="🛠️ Resources",
-            value=f"```CPU: {cpu_cores} vCPU(s)\nRAM: {mem_flag}\nSwap: disabled\nAuto-Delete: 4h Inactivity```",
+            value=(
+                "```"
+                f"CPU:  {cpu_cores} vCPU(s)\n"
+                f"RAM:  {mem_human} ({mem_flag})\n"
+                "Swap: disabled\n"
+                "Auto-Delete: 4h inactivity\n"
+                "```"
+            ),
             inline=False
         )
+
         await interaction.response.send_message(embed=embed)
         msg = await interaction.original_response()
 
@@ -392,15 +442,13 @@ async def deploy(
         embed.description = "```diff\n+ Pulling image & starting container...\n```"
         await msg.edit(embed=embed)
 
+        # We avoid cpuset-cpus to prevent invalid CPU indices on different hosts.
         rc, out, err = await runp(
             "docker", "run", "-itd", "--privileged",
             "--cpus", str(cpu_cores),
-            "--cpuset-cpus", cpuset,
             "--memory", mem_flag,
-            "--memory-swap", mem_flag,          # == memory => no swap
-            # Optional quality-of-life: prevent OOM-kill storms
+            "--memory-swap", mem_flag,  # no swap
             "--oom-kill-disable=false",
-            # label & env for identification
             "--label", "pycore=vps",
             "--env", "PYCORE=1",
             os_data["image"]
@@ -408,7 +456,15 @@ async def deploy(
         if rc != 0 or not out.strip():
             await msg.edit(embed=discord.Embed(
                 title="❌ Deployment Failed",
-                description=f"```docker run failed:\n{err.strip() or 'no error text'}\n```",
+                description=(
+                    "```diff\n"
+                    "- docker run failed\n"
+                    "---------------------------\n"
+                    f"STDOUT:\n{(out or '').strip() or 'no stdout'}\n"
+                    "---------------------------\n"
+                    f"STDERR:\n{(err or '').strip() or 'no stderr'}\n"
+                    "```"
+                ),
                 color=0xFF0000
             ))
             return
@@ -420,16 +476,10 @@ async def deploy(
         )
 
         # ---------- provisioning inside container ----------
-        embed.description = "```diff\n+ Updating system & enabling essential repos...\n```"
+        embed.description = "```diff\n+ Updating system & installing tools...\n```"
         await msg.edit(embed=embed)
         await animate_message(interaction, "Configuring Environment", embed, LOADING_ANIMATION, 2)
 
-        # This script:
-        # - Detects PM
-        # - Enables popular/essential repos per distro (universe/multiverse, EPEL, community, etc.)
-        # - Full update/upgrade
-        # - Installs: tmate, curl, wget, git, nano, htop, fastfetch/neofetch, procps/coreutils, ca-certificates
-        # - Custom MOTD "Welcome To PyCore Cloud VPS !" and disables Ubuntu Pro/motd ads
         provision_script = r'''
 set -e
 
@@ -445,27 +495,25 @@ detect_pm() {
 
 PM=$(detect_pm)
 
-# Common helpers/tools list
 COMMON_PKGS="curl wget git nano htop ca-certificates"
-EXTRA_PKGS=""
 SYS_PKGS=""
 
 case "$PM" in
   apt)
     export DEBIAN_FRONTEND=noninteractive
-    # enable universe/multiverse (Ubuntu)
+    # Enable universe/multiverse for Ubuntu-like images
     if [ -f /etc/lsb-release ] || grep -qi ubuntu /etc/os-release 2>/dev/null; then
       apt-get update -y || true
       apt-get install -y software-properties-common || true
       add-apt-repository -y universe || true
       add-apt-repository -y multiverse || true
     fi
-    # update & upgrade
     apt-get update -y || true
     apt-get dist-upgrade -y || apt-get upgrade -y || true
-    # tools
     SYS_PKGS="tmate neofetch procps coreutils"
-    # disable ubuntu motd ads/pro news (best-effort)
+    apt-get install -y $SYS_PKGS $COMMON_PKGS || true
+
+    # Disable noisy Ubuntu MOTD news / ads
     mkdir -p /etc/default
     echo 'ENABLED=0' >/etc/default/motd-news || true
     echo 'DISABLE=1' >/etc/default/motd-news || true
@@ -473,29 +521,27 @@ case "$PM" in
     rm -f /etc/update-motd.d/50-motd-news 2>/dev/null || true
     rm -f /etc/update-motd.d/80-livepatch 2>/dev/null || true
     rm -f /etc/update-motd.d/91-release-upgrade 2>/dev/null || true
-    # ubuntu-advantage tools (ads) — try to purge if present
     apt-get purge -y ubuntu-advantage-tools 2>/dev/null || true
     ;;
 
   dnf|yum)
-    # enable epel if available (RHEL/Fedora family variants)
     if command -v dnf >/dev/null 2>&1; then
       dnf makecache -y || true
       dnf -y install epel-release || true
       dnf -y upgrade || true
       SYS_PKGS="tmate neofetch procps-ng coreutils"
-      $PM -y install $SYS_PKGS $COMMON_PKGS || true
+      dnf -y install $SYS_PKGS $COMMON_PKGS || true
     else
       yum makecache -y || true
       yum -y install epel-release || true
       yum -y update || true
       SYS_PKGS="tmate neofetch procps-ng coreutils"
-      $PM -y install $SYS_PKGS $COMMON_PKGS || true
+      yum -y install $SYS_PKGS $COMMON_PKGS || true
     fi
     ;;
 
   apk)
-    # ensure community repo
+    # Ensure community repo for Alpine
     if ! grep -q "community" /etc/apk/repositories 2>/dev/null; then
       echo "http://dl-cdn.alpinelinux.org/alpine/$(. /etc/os-release; echo ${VERSION_ID%.*})/community" >> /etc/apk/repositories || true
     fi
@@ -519,7 +565,7 @@ case "$PM" in
     ;;
 esac
 
-# Try fastfetch (nice) — ignore if not available in repo
+# Try fastfetch if available
 if command -v apt >/dev/null 2>&1; then
   apt-get install -y fastfetch 2>/dev/null || true
 elif command -v dnf >/dev/null 2>&1; then
@@ -532,7 +578,6 @@ fi
 
 # Custom MOTD
 mkdir -p /etc/profile.d /etc/update-motd.d
-# remove default noisy motd scripts if they exist (best-effort)
 rm -f /etc/update-motd.d/*-motd-news 2>/dev/null || true
 rm -f /etc/update-motd.d/*-help-text 2>/dev/null || true
 rm -f /etc/update-motd.d/*-ubuntu-advantage 2>/dev/null || true
@@ -540,7 +585,7 @@ rm -f /etc/update-motd.d/*-ubuntu-advantage 2>/dev/null || true
 cat >/etc/update-motd.d/00-pycore <<'PYCORE'
 #!/usr/bin/env bash
 echo "==============================================="
-echo "   Welcome To PyCore Cloud VPS !"
+echo "   Welcome To PyCore Cloud VPS!"
 echo "==============================================="
 if command -v fastfetch >/dev/null 2>&1; then
   fastfetch 2>/dev/null || true
@@ -591,23 +636,53 @@ fi
 SH
 chmod +x /etc/profile.d/10-motd-limits.sh
 
-# Ensure tmate runs fine later
+# Ensure tmate exists
 if ! command -v tmate >/dev/null 2>&1; then
   echo "WARNING: tmate not found via package manager." >&2
 fi
 '''
 
-        # exec provision
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", "-i", container_id, "bash", "-lc", provision_script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        pout, perr = await proc.communicate()
+        # Choose a shell that is more universal than bash (works for Alpine too)
+        # We try /bin/sh -c; most images provide that.
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "exec", "-i", container_id, "sh", "-c", provision_script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                pout, perr = await asyncio.wait_for(proc.communicate(), timeout=600)  # 10 minutes max
+            except asyncio.TimeoutError:
+                proc.kill()
+                await msg.edit(embed=discord.Embed(
+                    title="⚠️ Provisioning Timeout",
+                    description=(
+                        "```diff\n"
+                        "- Provisioning inside the container took too long.\n"
+                        "- The container will be removed to avoid leaks.\n"
+                        "```"
+                    ),
+                    color=0xFFA500
+                ))
+                # Cleanup container
+                await runp("docker", "kill", container_id)
+                await runp("docker", "rm", container_id)
+                return
+        except FileNotFoundError:
+            # Extremely minimal images with no sh
+            pout, perr = b"", b"sh not found in container"
+            proc = type("Dummy", (), {"returncode": 1})()  # simple stand-in
+
         if proc.returncode != 0:
             await msg.edit(embed=discord.Embed(
                 title="⚠️ Provisioning Warning",
-                description=f"```Some setup steps failed:\n{(perr or b'').decode()[:1200]}```",
+                description=(
+                    "```diff\n"
+                    "- Some setup steps failed\n"
+                    "---------------------------\n"
+                    f"{(perr or b'').decode()[:1200]}\n"
+                    "```"
+                ),
                 color=0xFFA500
             ))
 
@@ -615,52 +690,95 @@ fi
         embed.description = "```diff\n+ Generating SSH (tmate) session...\n```"
         await msg.edit(embed=embed)
 
+        # Quick check that tmate is present
+        check_rc, _, check_err = await runp(
+            "docker", "exec", container_id, "tmate", "-V"
+        )
+        if check_rc != 0:
+            await msg.edit(embed=discord.Embed(
+                title="⚠️ tmate Not Available",
+                description=(
+                    "```diff\n"
+                    "- tmate could not be started inside the container.\n"
+                    f"- Error:\n{check_err.strip() or 'unknown error'}\n"
+                    "```"
+                ),
+                color=0xFFA500
+            ))
+            # We keep the container running but cannot provide a tmate session.
+            return
+
         exec_cmd = await asyncio.create_subprocess_exec(
             "docker", "exec", container_id, "tmate", "-F",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        ssh_session_line = await capture_ssh_session_line(exec_cmd)
+
+        # If your capture_ssh_session_line supports timeout, we wrap it with wait_for
+        try:
+            ssh_session_line = await asyncio.wait_for(
+                capture_ssh_session_line(exec_cmd), timeout=120
+            )
+        except asyncio.TimeoutError:
+            exec_cmd.kill()
+            ssh_session_line = None
 
         if ssh_session_line:
             add_to_database(str(user), container_id, ssh_session_line)
 
-            # admin DM in-channel
+            # Admin summary (ephemeral)
             admin_embed = discord.Embed(
                 title=f"🎉 {os_data['emoji']} {os_data['name']} Instance Ready!",
-                description=(f"**Successfully deployed for {user.mention}**\n\n"
-                             f"**🔑 SSH Command:**\n```{ssh_session_line}```"),
+                description=(
+                    f"**Successfully deployed for {user.mention}**\n\n"
+                    f"**🔑 SSH Command (tmate):**\n```{ssh_session_line}```"
+                ),
                 color=0x00FF00
             )
             admin_embed.add_field(
                 name="📦 Container Info",
-                value=(f"```ID: {container_id[:12]}\n"
-                       f"OS: {os_data['name']}\n"
-                       f"CPU: {cpu_cores} vCPU(s)\n"
-                       f"RAM: {mem_flag}\n"
-                       f"Status: Running```"),
+                value=(
+                    "```"
+                    f"ID:   {container_id[:12]}\n"
+                    f"OS:   {os_data['name']}\n"
+                    f"CPU:  {cpu_cores} vCPU(s)\n"
+                    f"RAM:  {mem_human} ({mem_flag})\n"
+                    "Status: Running\n"
+                    "```"
+                ),
                 inline=False
             )
             admin_embed.set_footer(text="💎 This instance will auto-delete after 4 hours of inactivity")
             await interaction.followup.send(embed=admin_embed, ephemeral=True)
 
-            # notify user (DM)
+            # User DM
             try:
                 user_embed = discord.Embed(
                     title=f"✨ Your {os_data['name']} Instance is Ready!",
-                    description=(f"**SSH Access (tmate):**\n```{ssh_session_line}```\n\n"
-                                 f"Deployed by: {interaction.user.mention}"),
+                    description=(
+                        f"**SSH Access (tmate):**\n```{ssh_session_line}```\n\n"
+                        f"Deployed by: {interaction.user.mention}"
+                    ),
                     color=EMBED_COLOR
                 )
                 user_embed.add_field(
                     name="💡 Getting Started",
-                    value=("```Connect using any SSH client if needed\n"
-                           "Username: root\nNo password required\n"
-                           "Helpful: fastfetch/neofetch, cgroup-limits```"),
+                    value=(
+                        "```"
+                        "Connect using the tmate SSH command above.\n"
+                        "User: root\n"
+                        "No password required.\n\n"
+                        "Helpful commands:\n"
+                        "  - fastfetch / neofetch\n"
+                        "  - cgroup-limits\n"
+                        "  - htop\n"
+                        "```"
+                    ),
                     inline=False
                 )
                 await user.send(embed=user_embed)
             except discord.Forbidden:
+                # User has DMs closed; ignore
                 pass
 
             ok = discord.Embed(
@@ -669,29 +787,56 @@ fi
                 color=0x00FF00
             )
             await msg.edit(embed=ok)
+
         else:
-            # rollback
+            # No SSH line => rollback to avoid "zombie" containers
             await msg.edit(embed=discord.Embed(
                 title=f"⚠️ Timeout {random.choice(ERROR_ANIMATION)}",
-                description="```diff\n- SSH configuration timed out...\n- Rolling back deployment\n```",
+                description=(
+                    "```diff\n"
+                    "- Failed to obtain tmate SSH session within the timeout.\n"
+                    "- Rolling back and removing the container.\n"
+                    "```"
+                ),
                 color=0xFF0000
             ))
-            await asyncio.create_subprocess_exec("docker", "kill", container_id, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-            await asyncio.create_subprocess_exec("docker", "rm", container_id, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await runp("docker", "kill", container_id)
+            await runp("docker", "rm", container_id)
 
     except Exception as e:
         print(f"Error in deploy command: {e}")
         try:
-            await interaction.followup.send(
-                embed=discord.Embed(
-                    title="💥 Critical Error",
-                    description="```diff\n- An unexpected error occurred\n- Please try again later\n```",
-                    color=0xFF0000
-                ),
-                ephemeral=True
-            )
-        except:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="💥 Critical Error",
+                        description=(
+                            "```diff\n"
+                            "- An unexpected error occurred while deploying.\n"
+                            "- Please try again later or contact an administrator.\n"
+                            "```"
+                        ),
+                        color=0xFF0000
+                    ),
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    embed=discord.Embed(
+                        title="💥 Critical Error",
+                        description=(
+                            "```diff\n"
+                            "- An unexpected error occurred while deploying.\n"
+                            "- Please try again later or contact an administrator.\n"
+                            "```"
+                        ),
+                        color=0xFF0000
+                    ),
+                    ephemeral=True
+                )
+        except Exception:
             pass
+
 @bot.tree.command(name="manage_vps", description="Start/Stop/Restart/Regen SSH, logs & more in an Embed GUI")
 @app_commands.describe(container_id="Your instance ID (first 4+ characters)")
 async def manage_vps(interaction: discord.Interaction, container_id: str):
