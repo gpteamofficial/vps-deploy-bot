@@ -9,7 +9,7 @@ import psutil
 from datetime import datetime
 import re
 import time
-time.sleep(1) # SLEEP 1
+time.sleep(2)
 # Configuration
 TOKEN = 'your_token'  # REPLACE WITH YOUR BOT'S TOKEN
 RAM_LIMIT = '12g' # ابعد ايدك لا ابيدك  - DONT EDOT
@@ -834,9 +834,9 @@ fi
                     ),
                     ephemeral=True
                 )
-        except Exception:
+        except Exception as e:
             pass
-
+            print(f"error\n -----------:\n============ {e}\n -----------:\n============")
 @bot.tree.command(name="manage_vps", description="Start/Stop/Restart/Regen SSH, logs & more in an Embed GUI")
 @app_commands.describe(container_id="Your instance ID (first 4+ characters)")
 async def manage_vps(interaction: discord.Interaction, container_id: str):
@@ -1174,7 +1174,7 @@ async def manage_vps(interaction: discord.Interaction, container_id: str):
 
                 confirm = discord.Embed(
                     title="⚠️ Confirm Force Deletion",
-                    description=f"You're about to **permanently delete** `{info['id'][:12]}`. This cannot be undone.",
+                    description=f"You're about to **permanently delete??, this action can`t be undone** `{info['id'][:12]}`. This cannot be undone.",
                     color=0xFF0000
                 )
 
